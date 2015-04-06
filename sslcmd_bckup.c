@@ -46,6 +46,152 @@ HMODULE g_hSecurity            = NULL;
 SCHANNEL_CRED SchannelCred;
 PSecurityFunctionTable g_pSSPI;
 
+
+
+/*****************************************************************************/
+static void DisplayWinVerifyTrustError(DWORD Status)
+{
+  LPSTR pszName = NULL;
+
+  switch(Status)
+  {
+  case CERT_E_EXPIRED:                pszName = "CERT_E_EXPIRED";                 break;
+  case CERT_E_VALIDITYPERIODNESTING:  pszName = "CERT_E_VALIDITYPERIODNESTING";   break;
+  case CERT_E_ROLE:                   pszName = "CERT_E_ROLE";                    break;
+  case CERT_E_PATHLENCONST:           pszName = "CERT_E_PATHLENCONST";            break;
+  case CERT_E_CRITICAL:               pszName = "CERT_E_CRITICAL";                break;
+  case CERT_E_PURPOSE:                pszName = "CERT_E_PURPOSE";                 break;
+  case CERT_E_ISSUERCHAINING:         pszName = "CERT_E_ISSUERCHAINING";          break;
+  case CERT_E_MALFORMED:              pszName = "CERT_E_MALFORMED";               break;
+  case CERT_E_UNTRUSTEDROOT:          pszName = "CERT_E_UNTRUSTEDROOT";           break;
+  case CERT_E_CHAINING:               pszName = "CERT_E_CHAINING";                break;
+  case TRUST_E_FAIL:                  pszName = "TRUST_E_FAIL";                   break;
+  case CERT_E_REVOKED:                pszName = "CERT_E_REVOKED";                 break;
+  case CERT_E_UNTRUSTEDTESTROOT:      pszName = "CERT_E_UNTRUSTEDTESTROOT";       break;
+  case CERT_E_REVOCATION_FAILURE:     pszName = "CERT_E_REVOCATION_FAILURE";      break;
+  case CERT_E_CN_NO_MATCH:            pszName = "CERT_E_CN_NO_MATCH";             break;
+  case CERT_E_WRONG_USAGE:            pszName = "CERT_E_WRONG_USAGE";             break;
+  default:                            pszName = "(unknown)";                      break;
+  }
+  printf("Error 0x%x (%s) returned by CertVerifyCertificateChainPolicy!\n", Status, pszName);
+}
+
+
+/*****************************************************************************/
+static void DisplayWinSockError(DWORD ErrCode)
+{
+  LPSTR pszName = NULL; // http://www.sockets.com/err_lst1.htm#WSANO_DATA
+
+  switch(ErrCode) // http://msdn.microsoft.com/en-us/library/ms740668(VS.85).aspx
+  {
+  case     10035:  pszName = "WSAEWOULDBLOCK    "; break;
+  case     10036:  pszName = "WSAEINPROGRESS    "; break;
+  case     10037:  pszName = "WSAEALREADY       "; break;
+  case     10038:  pszName = "WSAENOTSOCK       "; break;
+  case     10039:  pszName = "WSAEDESTADDRREQ   "; break;
+  case     10040:  pszName = "WSAEMSGSIZE       "; break;
+  case     10041:  pszName = "WSAEPROTOTYPE     "; break;
+  case     10042:  pszName = "WSAENOPROTOOPT    "; break;
+  case  10043:  pszName = "WSAEPROTONOSUPPORT"; break;
+  case  10044:  pszName = "WSAESOCKTNOSUPPORT"; break;
+  case     10045:  pszName = "WSAEOPNOTSUPP     "; break;
+  case     10046:  pszName = "WSAEPFNOSUPPORT   "; break;
+  case     10047:  pszName = "WSAEAFNOSUPPORT   "; break;
+  case     10048:  pszName = "WSAEADDRINUSE     "; break;
+  case     10049:  pszName = "WSAEADDRNOTAVAIL  "; break;
+  case     10050:  pszName = "WSAENETDOWN       "; break;
+  case     10051:  pszName = "WSAENETUNREACH    "; break;
+  case     10052:  pszName = "WSAENETRESET      "; break;
+  case     10053:  pszName = "WSAECONNABORTED   "; break;
+  case     10054:  pszName = "WSAECONNRESET     "; break;
+  case     10055:  pszName = "WSAENOBUFS        "; break;
+  case     10056:  pszName = "WSAEISCONN        "; break;
+  case     10057:  pszName = "WSAENOTCONN       "; break;
+  case     10058:  pszName = "WSAESHUTDOWN      "; break;
+  case     10059:  pszName = "WSAETOOMANYREFS   "; break;
+  case     10060:  pszName = "WSAETIMEDOUT      "; break;
+  case     10061:  pszName = "WSAECONNREFUSED   "; break;
+  case     10062:  pszName = "WSAELOOP          "; break;
+  case     10063:  pszName = "WSAENAMETOOLONG   "; break;
+  case     10064:  pszName = "WSAEHOSTDOWN      "; break;
+  case     10065:  pszName = "WSAEHOSTUNREACH   "; break;
+  case     10066:  pszName = "WSAENOTEMPTY      "; break;
+  case     10067:  pszName = "WSAEPROCLIM       "; break;
+  case     10068:  pszName = "WSAEUSERS         "; break;
+  case     10069:  pszName = "WSAEDQUOT         "; break;
+  case     10070:  pszName = "WSAESTALE         "; break;
+  case     10071:  pszName = "WSAEREMOTE        "; break;
+  case     10091:  pszName = "WSASYSNOTREADY    "; break;
+  case  10092:  pszName = "WSAVERNOTSUPPORTED"; break;
+  case     10093:  pszName = "WSANOTINITIALISED "; break;
+  case     11001:  pszName = "WSAHOST_NOT_FOUND "; break;
+  case     11002:  pszName = "WSATRY_AGAIN      "; break;
+  case     11003:  pszName = "WSANO_RECOVERY    "; break;
+  case     11004:  pszName = "WSANO_DATA        "; break;
+  }
+  printf("Error 0x%x (%s)\n", ErrCode, pszName);
+}
+
+/*****************************************************************************/
+static void DisplaySECError(DWORD ErrCode)
+{
+  LPSTR pszName = NULL; // WinError.h
+
+  switch(ErrCode)
+  {
+  case     SEC_E_BUFFER_TOO_SMALL:
+    pszName = "SEC_E_BUFFER_TOO_SMALL - The message buffer is too small. Used with the Digest SSP.";
+    break;
+
+  case     SEC_E_CRYPTO_SYSTEM_INVALID:
+    pszName = "SEC_E_CRYPTO_SYSTEM_INVALID - The cipher chosen for the security context is not supported. Used with the Digest SSP.";
+    break;
+  case     SEC_E_INCOMPLETE_MESSAGE:
+    pszName = "SEC_E_INCOMPLETE_MESSAGE - The data in the input buffer is incomplete. The application needs to read more data from the server and call DecryptMessage (General) again.";
+    break;
+
+  case     SEC_E_INVALID_HANDLE:
+    pszName = "SEC_E_INVALID_HANDLE - A context handle that is not valid was specified in the phContext parameter. Used with the Digest and Schannel SSPs.";
+    break;
+
+  case     SEC_E_INVALID_TOKEN:
+    pszName = "SEC_E_INVALID_TOKEN - The buffers are of the wrong type or no buffer of type SECBUFFER_DATA was found. Used with the Schannel SSP.";
+    break;
+    
+  case     SEC_E_MESSAGE_ALTERED:
+    pszName = "SEC_E_MESSAGE_ALTERED - The message has been altered. Used with the Digest and Schannel SSPs.";
+    break;
+    
+  case     SEC_E_OUT_OF_SEQUENCE:
+    pszName = "SEC_E_OUT_OF_SEQUENCE - The message was not received in the correct sequence.";
+    break;
+    
+  case     SEC_E_QOP_NOT_SUPPORTED:
+    pszName = "SEC_E_QOP_NOT_SUPPORTED - Neither confidentiality nor integrity are supported by the security context. Used with the Digest SSP.";
+    break;
+    
+  case     SEC_I_CONTEXT_EXPIRED:
+    pszName = "SEC_I_CONTEXT_EXPIRED - The message sender has finished using the connection and has initiated a shutdown.";
+    break;
+    
+  case     SEC_I_RENEGOTIATE:
+    pszName = "SEC_I_RENEGOTIATE - The remote party requires a new handshake sequence or the application has just initiated a shutdown.";
+    break;
+    
+  case     SEC_E_ENCRYPT_FAILURE:
+    pszName = "SEC_E_ENCRYPT_FAILURE - The specified data could not be encrypted.";
+    break;
+    
+  case     SEC_E_DECRYPT_FAILURE:
+    pszName = "SEC_E_DECRYPT_FAILURE - The specified data could not be decrypted.";
+    break;
+
+  }
+  printf("Error 0x%x %s \n", ErrCode, pszName);
+}
+
+
+
 /*****************************************************************************/
 static void DisplayCertChain( PCCERT_CONTEXT  pServerCert, BOOL fLocal )
 {
@@ -208,6 +354,79 @@ static void DisplayConnectionInfo( CtxtHandle *phContext )
   }
 
   printf("Key exchange strength: %d\n", ConnectionInfo.dwExchStrength);
+}
+
+
+/*****************************************************************************/
+static void PrintHexDump( DWORD length, PBYTE buffer )
+{
+  DWORD i,count,index;
+  CHAR rgbDigits[]="0123456789abcdef";
+  CHAR rgbLine[100];
+  char cbLine;
+
+  for(index = 0; length; length -= count, buffer += count, index += count)
+  {
+    count = (length > 16) ? 16:length;
+    sprintf(rgbLine, "%4.4x  ",index);
+    cbLine = 6;
+
+    for(i=0;i<count;i++)
+    {
+      rgbLine[cbLine++] = rgbDigits[buffer[i] >> 4];
+      rgbLine[cbLine++] = rgbDigits[buffer[i] & 0x0f];
+      if(i == 7) rgbLine[cbLine++] = ':';
+      else rgbLine[cbLine++] = ' ';
+    }
+    for(; i < 16; i++)
+    {
+      rgbLine[cbLine++] = ' ';
+      rgbLine[cbLine++] = ' ';
+      rgbLine[cbLine++] = ' ';
+    }
+    rgbLine[cbLine++] = ' ';
+
+    for(i = 0; i < count; i++)
+    {
+      if(buffer[i] < 32 || buffer[i] > 126 || buffer[i] == '%') rgbLine[cbLine++] = '.';
+      else rgbLine[cbLine++] = buffer[i];
+    }
+    rgbLine[cbLine++] = 0;
+    printf("%s\n", rgbLine);
+  }
+}
+
+/*****************************************************************************/
+static void PrintText( DWORD length, PBYTE buffer ) // handle unprintable charaters
+{
+  int i; //
+
+  printf("\n"); // "length = %d bytes \n", length);
+  for( i = 0; i < (int)length; i++ )
+  {
+    if( buffer[i] == 10 || buffer[i] == 13 )
+    printf("%c", (char)buffer[i]);
+    else if( buffer[i] < 32 || buffer[i] > 126 || buffer[i] == '%' )
+    printf("%c", '.');
+    else
+    printf("%c", (char)buffer[i]);
+  }
+  printf("\n");
+}
+
+/*****************************************************************************/
+static void WriteDataToFile( PSTR pszData, PBYTE pbData, DWORD cbData )
+{
+  FILE *file;
+
+  file = fopen(pszData, "wb");
+  if(file == NULL)
+  { printf("**** Error opening file '%s'\n", pszData); return; }
+
+  if(fwrite(pbData, 1, cbData, file) != cbData)
+  { printf("**** Error writing to file\n"); return; }
+
+  fclose(file);
 }
 
 /*****************************************************************************/
@@ -869,21 +1088,23 @@ CtxtHandle *phContext, BOOL fDoInitialRead, SecBuffer *pExtraData)
 
 
 /*****************************************************************************/
-static SECURITY_STATUS PerformClientHandshake (SOCKET Socket, PCredHandle phCreds, LPSTR pszServerName, 
-    CtxtHandle *phContext, SecBuffer *pExtraData)
+static SECURITY_STATUS PerformClientHandshake( SOCKET          Socket,        // in
+PCredHandle     phCreds,       // in
+LPSTR           pszServerName, // in
+CtxtHandle *    phContext,     // out
+SecBuffer *     pExtraData )   // out
 {
+
   SecBufferDesc   OutBuffer;
   SecBuffer       OutBuffers[1];
   DWORD           dwSSPIFlags, dwSSPIOutFlags, cbData;
   TimeStamp       tsExpiry;
   SECURITY_STATUS scRet;
 
-  dwSSPIFlags = ISC_REQ_SEQUENCE_DETECT | 
-                ISC_REQ_REPLAY_DETECT   | 
-                ISC_REQ_CONFIDENTIALITY | 
-                ISC_RET_EXTENDED_ERROR  | 
-                ISC_REQ_ALLOCATE_MEMORY | 
-                ISC_REQ_STREAM;
+
+  dwSSPIFlags = ISC_REQ_SEQUENCE_DETECT   | ISC_REQ_REPLAY_DETECT     | ISC_REQ_CONFIDENTIALITY   |
+  ISC_RET_EXTENDED_ERROR    | ISC_REQ_ALLOCATE_MEMORY   | ISC_REQ_STREAM;
+
 
   //  Initiate a ClientHello message and generate a token.
   OutBuffers[0].pvBuffer   = NULL;
@@ -894,37 +1115,39 @@ static SECURITY_STATUS PerformClientHandshake (SOCKET Socket, PCredHandle phCred
   OutBuffer.pBuffers  = OutBuffers;
   OutBuffer.ulVersion = SECBUFFER_VERSION;
 
-  scRet=g_pSSPI->InitializeSecurityContextA (phCreds, NULL, pszServerName, dwSSPIFlags, 
-      0, SECURITY_NATIVE_DREP, NULL, 0, phContext, &OutBuffer, &dwSSPIOutFlags, &tsExpiry);
+  scRet = g_pSSPI->InitializeSecurityContextA(  phCreds,
+  NULL,
+  pszServerName,
+  dwSSPIFlags,
+  0,
+  SECURITY_NATIVE_DREP,
+  NULL,
+  0,
+  phContext,
+  &OutBuffer,
+  &dwSSPIOutFlags,
+  &tsExpiry );
 
-  if (scRet != SEC_I_CONTINUE_NEEDED) { 
-    printf("**** Error %d returned by InitializeSecurityContext (1)\n", scRet); 
-    return scRet; 
-  }
+  if(scRet != SEC_I_CONTINUE_NEEDED) { printf("**** Error %d returned by InitializeSecurityContext (1)\n", scRet); return scRet; }
 
   // Send response to server if there is one.
-  if (OutBuffers[0].cbBuffer != 0 && OutBuffers[0].pvBuffer != NULL)
+  if(OutBuffers[0].cbBuffer != 0 && OutBuffers[0].pvBuffer != NULL)
   {
-    cbData = send (Socket, OutBuffers[0].pvBuffer, OutBuffers[0].cbBuffer, 0 );
-    if (cbData == SOCKET_ERROR || cbData == 0)
+    cbData = send( Socket, OutBuffers[0].pvBuffer, OutBuffers[0].cbBuffer, 0 );
+    if( cbData == SOCKET_ERROR || cbData == 0 )
     {
       printf("**** Error %d sending data to server (1)\n", WSAGetLastError());
-      
-      g_pSSPI->FreeContextBuffer (OutBuffers[0].pvBuffer);
-      g_pSSPI->DeleteSecurityContext (phContext);
-      
+      g_pSSPI->FreeContextBuffer(OutBuffers[0].pvBuffer);
+      g_pSSPI->DeleteSecurityContext(phContext);
       return SEC_E_INTERNAL_ERROR;
     }
     printf("%d bytes of handshake data sent\n", cbData);
-    
-    if (fVerbose) { 
-      PrintHexDump (cbData, OutBuffers[0].pvBuffer); 
-      printf("\n"); 
-    }
-    g_pSSPI->FreeContextBuffer (OutBuffers[0].pvBuffer); // Free output buffer.
+    if(fVerbose) { PrintHexDump(cbData, OutBuffers[0].pvBuffer); printf("\n"); }
+    g_pSSPI->FreeContextBuffer(OutBuffers[0].pvBuffer); // Free output buffer.
     OutBuffers[0].pvBuffer = NULL;
   }
-  return ClientHandshakeLoop (Socket, phCreds, phContext, TRUE, pExtraData);
+
+  return ClientHandshakeLoop(Socket, phCreds, phContext, TRUE, pExtraData);
 }
 
 
@@ -1034,6 +1257,7 @@ static SECURITY_STATUS ReadDecrypt( SOCKET Socket, PCredHandle phCreds, CtxtHand
       }
     }
 
+
     // Decrypt the received data.
     Buffers[0].pvBuffer     = pbIoBuffer;
     Buffers[0].cbBuffer     = cbIoBuffer;
@@ -1081,6 +1305,8 @@ static SECURITY_STATUS ReadDecrypt( SOCKET Socket, PCredHandle phCreds, CtxtHand
         if( buff[length-2] == 13 && buff[length-1] == 10 ) break; // printf("Found CRLF\n");
       }
     }
+
+
 
     // Move any "extra" data to the input buffer.
     if(pExtraBuffer)
